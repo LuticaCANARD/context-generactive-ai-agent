@@ -71,7 +71,16 @@ const make = Effect.gen(function* () {
     Effect.gen(function* () {
       const pending = selectPending.all(embedder.identity, limit).map((row) => decodePending(row));
       if (pending.length === 0) return 0;
-      const embedded = yield* embedder.embed(pending.map((node) => node.text));
+      const texts = pending.map((node) => node.text);
+      const spans = embedder.chunks === undefined ? undefined : yield* embedder.chunks(texts);
+      const inputs = pending.flatMap((node, row) =>
+        spans === undefined
+          ? [{ node, ordinal: 0, start: 0, end: node.text.length }]
+          : spans[row]!.map((span, ordinal) => ({ node, ordinal, ...span })),
+      );
+      const embedded = yield* embedder.embed(
+        inputs.map(({ node, start, end }) => node.text.slice(start, end)),
+      );
       // Embedding is an asynchronous external boundary. Revalidation enters the short publication
       // permit with add/save/commit, so a concurrent invalidation cannot create an obsolete mapping.
       const published = yield* vectors.publish(
@@ -88,20 +97,73 @@ const make = Effect.gen(function* () {
                 .map((row) => decodePending(row)),
             catch: () => IndexingError.make({ reason: "revalidation-failed" }),
           });
-          const accepted = pending.flatMap((node, row) =>
+          const accepted = inputs.flatMap(({ node, ordinal, start, end }, row) =>
             fresh.some((current) => current.seq === node.seq && current.text === node.text)
-              ? [{ seq: node.seq, vector: embedded[row]! }]
+              ? [{ seq: node.seq, vector: embedded[row]!, ordinal, start, end }]
               : [],
           );
-          const seqs = accepted.map((node) => node.seq);
+          const nodeSeqs = [...new Set(accepted.map((node) => node.seq))];
+          // Reserve mappings inside the publication gate, before saving vectors. Only node_vectors
+          // marks a fully committed node. Startup removes reserved chunks without that marker.
+          const seqs =
+            spans === undefined
+              ? nodeSeqs
+              : yield* Effect.try({
+                  try: () =>
+                    atomic(() =>
+                      accepted.map((chunk) =>
+                        Number(
+                          sqlite
+                            .prepare(
+                              "INSERT INTO node_vector_chunks(node_seq,embedder,ordinal,start_offset,end_offset) VALUES (?,?,?,?,?)",
+                            )
+                            .run(
+                              chunk.seq,
+                              embedder.identity,
+                              chunk.ordinal,
+                              chunk.start,
+                              chunk.end,
+                            ).lastInsertRowid,
+                        ),
+                      ),
+                    ),
+                  catch: () => IndexingError.make({ reason: "mapping-commit-failed" }),
+                });
           return {
             seqs,
             vectors: accepted.map((node) => node.vector),
             commit: Effect.try({
               try: () =>
                 atomic(() => {
-                  for (const seq of seqs) markIndexed.run(seq, embedder.identity);
-                  return accepted.length;
+                  // Native add/save yielded to other agents. A purge or redaction can have
+                  // removed/changed the source since prepare, without taking this publication gate.
+                  let committed = 0;
+                  for (const seq of nodeSeqs) {
+                    const original = pending.find((node) => node.seq === seq)!;
+                    const current = sqlite
+                      .prepare(`SELECT n.seq, n.text FROM nodes n
+                      LEFT JOIN node_vectors v ON v.node_seq=n.seq AND v.embedder=?
+                      WHERE n.seq=? AND v.node_seq IS NULL AND ${meaningfulNodeFilter}
+                        AND ${embeddedKindFilter}`)
+                      .get(embedder.identity, seq);
+                    if (current !== undefined && decodePending(current).text === original.text) {
+                      markIndexed.run(seq, embedder.identity);
+                      committed++;
+                    } else if (spans !== undefined) {
+                      // The deletion trigger preserves removal IDs even if a purge already
+                      // cascaded these rows. Uncommitted chunks never enter the search allowlist.
+                      for (const [row, chunk] of accepted.entries())
+                        if (chunk.seq === seq)
+                          sqlite
+                            .prepare("DELETE FROM node_vector_chunks WHERE vector_id=?")
+                            .run(seqs[row]!);
+                    } else {
+                      sqlite
+                        .prepare("INSERT OR IGNORE INTO memory_graph_vector_removals VALUES (?,?)")
+                        .run(seq, embedder.identity);
+                    }
+                  }
+                  return committed;
                 }),
               catch: () => IndexingError.make({ reason: "mapping-commit-failed" }),
             }),
